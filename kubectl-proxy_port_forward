@@ -1,0 +1,122 @@
+#!/usr/bin/env sh
+# Based on https://github.com/kubernetes/kubernetes/issues/15180#issuecomment-533530687
+set -e
+
+kubectl=kubectl
+version=1.0.0
+generator=""
+nodefaultctx=0
+nodefaultns=0
+container_cpu="${KUBECTL_PROXY_PORT_FORWARD_POD_CPU:-100m}"
+container_memory="${KUBECTL_PROXY_PORT_FORWARD_POD_MEMORY:-256Mi}"
+
+while [ $# -gt 0 ]; do
+  key="$1"
+
+  case $key in
+  -v | --version)
+    echo "kubectl-proxy-port-forward $version"
+    exit 0
+    ;;
+  --context)
+    nodefaultctx=1
+    kubectl="$kubectl --context $2"
+    shift
+    shift
+    ;;
+  --kubecontext=*)
+    nodefaultctx=1
+    kubectl="$kubectl --context=${key##*=}"
+    shift
+    ;;
+  --kubeconfig)
+    kubectl="$kubectl --kubeconfig $2"
+    shift
+    shift
+    ;;
+  --kubeconfig=*)
+    kubectl="$kubectl --kubeconfig=${key##*=}"
+    shift
+    ;;
+  -n | --namespace)
+    nodefaultns=1
+    kubectl="$kubectl --namespace $2"
+    shift
+    shift
+    ;;
+  --namespace=*)
+    nodefaultns=1
+    kubectl="$kubectl --namespace=${key##*=}"
+    shift
+    ;;
+  --)
+    shift
+    break
+    ;;
+  *)
+    fwd="$fwd $1"
+    shift
+    ;;
+  esac
+done
+
+if [ -z "$fwd" ]; then
+  echo "At least one forwarding required"
+  exit 1
+fi
+
+# Set the default context and namespace to avoid situations where the user switch them during the build process
+[ "$nodefaultctx" = 1 ] || kubectl="$kubectl --context=$(${kubectl} config current-context)"
+[ "$nodefaultns" = 1 ] || kubectl="$kubectl --namespace=$(${kubectl} config view --minify --output 'jsonpath={.contexts..namespace}')"
+
+# Check the node and retrieve the node OS label
+image="${KUBECTL_PROXY_PORT_FORWARD_IMAGE:-ghcr.io/kvaps/alpine-socat:3.18}"
+name="port-forward"
+pod="${name}-$(env LC_ALL=C tr -dc a-z0-9 </dev/urandom | head -c 6)"
+ports=
+containers=
+i=0
+for f in $fwd; do
+  local=${f%%:*}
+  remote=${f#*:}
+  if ! ( [ "$local" -eq "$local" ] && [ "${remote#*:}" -eq "${remote#*:}" ] ) 2>/dev/null; then
+    echo "Forwarding '$f' is not valid!"
+    echo "Please use '<local_port>:<remote_host>:<remote_port>' format"
+    exit 123
+  fi
+  cmd="[ \"socat\", \"tcp-listen:$local,fork,reuseaddr\", \"tcp-connect:$remote\" ]"
+  ports="$ports $local:$local"
+  containers="${containers:+$containers,}
+$(cat <<EOT
+      {
+        "image": "$image",
+        "name": "socat-$i",
+        "command": $cmd,
+        "resources": {
+          "limits":   { "cpu": "${container_cpu}", "memory": "${container_memory}" },
+          "requests": { "cpu": "${container_cpu}", "memory": "${container_memory}" }
+        }
+      }
+EOT
+  )"
+  i=$(($i+1))
+done
+
+overrides="$(
+cat <<EOT
+{
+  "spec": {
+    "containers": [
+$containers
+    ]
+  }
+}
+EOT
+)"
+
+trap "EC=\$?; $kubectl delete pod --wait=false $pod >&2 || true; exit \$EC" EXIT INT TERM
+
+echo "spawning \"$pod\"" >&2
+$kubectl run --image "$image" --restart=Never --overrides="$overrides" "$pod" $generator
+$kubectl wait --for=condition=ready pod "$pod"
+$kubectl port-forward "$pod" $ports
